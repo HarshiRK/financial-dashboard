@@ -5,128 +5,132 @@ import re
 
 st.set_page_config(page_title="Universal Financial Dashboard", layout="wide")
 
-def safe_float(value):
-    """Prevents crashes by cleaning data and returning 0.0 if the cell is messy."""
-    if pd.isna(value) or str(value).strip() == "":
-        return 0.0
+def clean_amount(v):
+    """Universal number cleaner: handles 'Dr/Cr', currency, and formatting."""
+    if pd.isna(v) or str(v).strip() == "": return 0.0
+    s = str(v).upper().strip()
+    is_credit = any(x in s for x in ["CR", "-", "("])
+    s = re.sub(r'[^0-9.]', '', s)
     try:
-        s = str(value).upper()
-        is_credit = any(x in s for x in ["CR", "-", "("])
-        # Remove everything except numbers and decimals
-        num_str = re.sub(r'[^0-9.]', '', s)
-        if not num_str: return 0.0
-        num = float(num_str)
+        if s.count('.') > 1: # Fixes strings like 1.234.56
+            parts = s.split('.')
+            s = "".join(parts[:-1]) + "." + parts[-1]
+        num = float(s) if s else 0.0
         return -num if is_credit else num
-    except:
-        return 0.0
+    except: return 0.0
 
-def process_data(file):
+def process_file(file):
     try:
         df = pd.read_csv(file, header=None)
         
-        # 1. Locate the Start of Data (Particulars)
+        # 1. Locate the header row (contains 'Particulars' or 'Account')
         header_idx = None
         for i, row in df.iterrows():
-            row_txt = " ".join([str(x).lower() for x in row.values if pd.notna(x)])
-            if "particulars" in row_txt or "account" in row_txt:
+            row_str = " ".join([str(x).lower() for x in row.values if pd.notna(x)])
+            if any(k in row_str for k in ["particulars", "account"]):
                 header_idx = i
                 break
         
         if header_idx is None:
-            return None, "Could not find Account/Particulars column."
+            return None, "System could not identify the 'Particulars' or 'Account' column."
 
-        # 2. Identify Valid Numeric Columns (Balance, Debit, Credit)
         header_row = df.iloc[header_idx]
         data_rows = df.iloc[header_idx + 1:]
-        col_maps = []
+        all_data = []
 
+        # 2. Find every 'Balance' or 'Closing' column
         for i, col_val in enumerate(header_row):
-            name = str(col_val).lower()
-            if any(k in name for k in ["balance", "closing", "debit", "credit"]):
-                # Search for month label in the rows above
-                label = "Total"
-                for r in range(max(0, header_idx-5), header_idx):
-                    cell = str(df.iloc[r, i])
-                    if any(m in cell for m in ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "202"]):
-                        label = cell.strip().replace('[','').replace(']','')
+            col_name = str(col_val).lower().strip()
+            # We look for 'Balance' columns that aren't 'Opening'
+            prev_row_val = str(df.iloc[header_idx-1, i]).lower() if header_idx > 0 else ""
+            
+            if "balance" in col_name and "opening" not in col_name and "opening" not in prev_row_val:
+                # A. Find the closest 'Particulars' column to the left
+                account_col_idx = 0
+                for c in range(i, -1, -1):
+                    if "particular" in str(header_row[c]).lower() or "account" in str(header_row[c]).lower():
+                        account_col_idx = c
                         break
-                col_maps.append({"idx": i, "type": name, "month": label})
+                
+                # B. Identify the Month (Search rows above and to the left)
+                month = "Current Period"
+                found_m = False
+                month_keywords = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "202"]
+                for r in range(header_idx):
+                    for c in range(i, account_col_idx - 1, -1):
+                        cell = str(df.iloc[r, c])
+                        if any(m in cell for m in month_keywords):
+                            month = cell.strip()
+                            found_m = True
+                            break
+                    if found_m: break
+                
+                # C. Extract Data
+                temp_df = pd.DataFrame()
+                temp_df['Account'] = data_rows.iloc[:, account_col_idx].astype(str).str.strip()
+                temp_df['Amount'] = data_rows.iloc[:, i].apply(clean_amount)
+                temp_df['Month'] = month
+                # Remove junk rows (totals, empty lines)
+                temp_df = temp_df[~temp_df['Account'].str.lower().isin(['nan', 'total', 'grand total', '', 'particulars'])]
+                all_data.append(temp_df)
 
-        if not col_maps:
-            return None, "No numeric columns (Debit/Credit/Balance) found."
+        if not all_data:
+            return None, "No valid balance columns found. Ensure headers contain 'Balance' or 'Closing'."
 
-        # 3. Create Final Clean Table
-        final_list = []
-        months = list(dict.fromkeys([c['month'] for c in col_maps]))
-        
-        for m in months:
-            m_cols = [c for c in col_maps if c['month'] == m]
-            temp = pd.DataFrame()
-            temp['Account'] = data_rows.iloc[:, 0].astype(str).str.strip()
-            temp['Month'] = m
-            
-            # Math Logic
-            bal_col = next((c for c in m_cols if "balance" in c['type'] or "closing" in c['type']), None)
-            if bal_col:
-                temp['Amount'] = data_rows.iloc[:, bal_col['idx']].apply(safe_float)
-            else:
-                deb = next((c for c in m_cols if "debit" in c['type']), None)
-                cre = next((c for c in m_cols if "credit" in c['type']), None)
-                d_val = data_rows.iloc[:, deb['idx']].apply(safe_float) if deb else 0
-                c_val = data_rows.iloc[:, cre['idx']].apply(safe_float) if cre else 0
-                temp['Amount'] = d_val - c_val
-            
-            # Remove empty account rows
-            temp = temp[temp['Account'] != "nan"]
-            final_list.append(temp)
+        return pd.concat(all_data).reset_index(drop=True), None
 
-        return pd.concat(final_list).reset_index(drop=True), None
-        
     except Exception as e:
-        return None, f"System Error: {str(e)}"
+        return None, f"Error processing file: {str(e)}"
 
-# --- UI ---
+# --- APP UI ---
 st.title("📊 Universal Trial Balance Dashboard")
-st.write("Upload any CSV Trial Balance to get started.")
+st.markdown("Upload any Trial Balance CSV (compatible with side-by-side or vertical formats).")
 
-uploaded = st.sidebar.file_uploader("Choose CSV File", type="csv")
+uploaded_file = st.sidebar.file_uploader("Upload Trial Balance", type="csv")
 
-if uploaded:
-    data, err = process_data(uploaded)
+if uploaded_file:
+    data, err = process_file(uploaded_file)
     
     if err:
         st.error(err)
     elif data is not None:
         # Category Logic
-        def quick_cat(x):
-            x = x.lower()
-            if any(i in x for i in ['cash', 'bank', 'receivable', 'asset']): return 'Assets'
-            if any(i in x for i in ['payable', 'loan', 'capital', 'equity']): return 'Liabilities'
-            if any(i in x for i in ['sale', 'revenue', 'income']): return 'Revenue'
+        def categorize(acc):
+            acc = acc.lower()
+            if any(x in acc for x in ['cash', 'bank', 'receivable', 'asset', 'inventory', 'stock', 'prepaid']): return 'Assets'
+            if any(x in acc for x in ['payable', 'loan', 'capital', 'equity', 'reserve', 'liability', 'tax']): return 'Equity & Liab'
+            if any(x in acc for x in ['sale', 'revenue', 'income', 'indirect inc']): return 'Revenue'
             return 'Expenses'
         
-        data['Category'] = data['Account'].apply(quick_cat)
+        data['Category'] = data['Account'].apply(categorize)
         
-        # Month Filter
-        m_opt = data['Month'].unique()
-        sel_m = st.sidebar.selectbox("Select Period", m_opt)
-        view = data[data['Month'] == sel_m]
+        # Month Selector
+        m_list = list(data['Month'].unique())
+        selected_month = st.sidebar.selectbox("Select Month/Period", m_list)
+        view = data[data['Month'] == selected_month]
         
-        # Display Stats
-        a_val = view[view['Category'] == 'Assets']['Amount'].sum()
-        l_val = view[view['Category'] == 'Liabilities']['Amount'].sum()
+        # KPIs
+        assets = view[view['Category'] == 'Assets']['Amount'].sum()
+        liab = view[view['Category'] == 'Equity & Liab']['Amount'].sum()
         
         c1, c2, c3 = st.columns(3)
-        c1.metric("Total Assets", f"₹{abs(a_val):,.2f}")
-        c2.metric("Total Liab/Equity", f"₹{abs(l_val):,.2f}")
-        c3.metric("Status", "Balanced ✅" if abs(a_val + l_val) < 10 else "Difference ⚠️")
-        
+        c1.metric("Total Assets", f"₹{abs(assets):,.2f}")
+        c2.metric("Equity & Liabilities", f"₹{abs(liab):,.2f}")
+        c3.metric("Balance Status", "Balanced ✅" if abs(assets + liab) < 100 else "Difference ⚠️")
+
         st.divider()
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Financial Breakdown")
+        
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.subheader("Financial Mix")
             fig = px.pie(view, values=view['Amount'].abs(), names='Category', hole=0.4)
             st.plotly_chart(fig, use_container_width=True)
-        with col2:
-            st.subheader("Account List")
-            st.dataframe(view[['Account', 'Category', 'Amount']], height=400, use_container_width=True)
+            
+        with col_right:
+            st.subheader("Top Accounts")
+            top_accounts = view.nlargest(10, 'Amount')
+            fig2 = px.bar(top_accounts, x='Amount', y='Account', orientation='h', color='Category')
+            st.plotly_chart(fig2, use_container_width=True)
+
+        st.subheader("Detailed Data")
+        st.dataframe(view[['Account', 'Category', 'Amount']], use_container_width=True, height=400)
