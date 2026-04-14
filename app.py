@@ -3,108 +3,109 @@ import pandas as pd
 import plotly.express as px
 import re
 
-st.set_page_config(page_title="Master Financial Dashboard", layout="wide")
+st.set_page_config(page_title="Universal Financial Dashboard", layout="wide")
 
-def clean_val(v):
-    """Universal number cleaner: handles 'Dr/Cr', currency, and formatting."""
+def clean_to_float(v):
+    """Aggressive cleaner for Dr/Cr and formatted numbers."""
     if pd.isna(v) or str(v).strip() == "": return 0.0
     s = str(v).upper().strip()
-    # Detect Credit (Liability/Revenue)
     is_credit = any(x in s for x in ["CR", "-", "("])
-    # Keep only digits and decimal points
+    # Extract only digits and decimal
     s = re.sub(r'[^0-9.]', '', s)
     try:
         if s.count('.') > 1:
             parts = s.split('.')
             s = "".join(parts[:-1]) + "." + parts[-1]
-        num = float(s) if s else 0.0
-        return -num if is_credit else num
+        val = float(s) if s else 0.0
+        return -val if is_credit else val
     except: return 0.0
 
-def process_any_file(file):
+def universal_parser(file):
     try:
         df = pd.read_csv(file, header=None)
         
-        # 1. Identify all Header Rows (Finding 'Particulars' or 'Account')
+        # 1. Find the Main Header (row containing 'Particulars')
         header_idx = None
         for i, row in df.iterrows():
-            row_str = " ".join([str(x).lower() for x in row.values if pd.notna(x)])
-            if any(k in row_str for k in ["particulars", "account"]):
+            if any("particular" in str(x).lower() for x in row.values):
                 header_idx = i
                 break
         
         if header_idx is None:
-            return None, "Error: Could not find 'Particulars' or 'Account' header."
+            return None, "Error: Could not find 'Particulars' header."
 
         header_row = df.iloc[header_idx]
         data_rows = df.iloc[header_idx + 1:]
         
-        # 2. Find ALL 'Particulars' columns (important for side-by-side files like trialbal2)
-        part_cols = [i for i, v in enumerate(header_row) if any(k in str(v).lower() for k in ["particular", "account"])]
+        # 2. Identify every 'Particulars' or Account column
+        # This handles your change where you added Particulars for every month.
+        account_cols = []
+        for i, val in enumerate(header_row):
+            v_str = str(val).lower()
+            if "particular" in v_str or "account" in v_str or v_str == "`":
+                account_cols.append(i)
         
-        all_segments = []
+        all_month_data = []
         month_keywords = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "202"]
 
-        # 3. Process each segment of the CSV
-        for start_col in part_cols:
-            # Find the end of this segment (until the next Particulars column or end of file)
-            end_col = len(header_row)
-            for p in part_cols:
-                if p > start_col:
-                    end_col = p
-                    break
+        # 3. Process the file horizontally
+        for i, val in enumerate(header_row):
+            h_name = str(val).lower().strip()
+            # We look for "Balance" columns that are NOT "Opening"
+            prev_val = str(df.iloc[header_idx-1, i]).lower().strip() if header_idx > 0 else ""
             
-            # Within this segment, find columns that mean 'Balance' or 'Closing'
-            for c in range(start_col, end_col):
-                h_val = str(header_row[c]).lower()
-                # Check row above for "Closing" context
-                prev_val = str(df.iloc[header_idx-1, c]).lower() if header_idx > 0 else ""
+            if "balance" in h_name or "closing" in h_name:
+                if "opening" in h_name or "opening" in prev_val:
+                    continue # Skip opening balances
                 
-                if "balance" in h_val or "closing" in h_val:
-                    # Skip if it's explicitly an "Opening" balance
-                    if "opening" in h_val or "opening" in prev_val:
-                        continue
-                        
-                    # Find the Month (Search rows above this column)
-                    month_label = "Total/Current"
-                    found_m = False
-                    for r in range(header_idx):
-                        for search_c in range(c, start_col - 1, -1):
-                            cell = str(df.iloc[r, search_c])
-                            if any(m in cell for m in month_keywords):
-                                month_label = cell.strip().replace('[','').replace(']','')
-                                found_m = True
-                                break
-                        if found_m: break
-                    
-                    # Extract the actual data
-                    temp = pd.DataFrame()
-                    temp['Account'] = data_rows.iloc[:, start_col].astype(str).str.strip()
-                    temp['Amount'] = data_rows.iloc[:, c].apply(clean_val)
-                    temp['Month'] = month_label
-                    # Filter out garbage rows
-                    temp = temp[~temp['Account'].str.lower().isin(['nan', 'total', 'grand total', 'particulars', ''])]
-                    all_segments.append(temp)
+                # Find the closest Account/Particulars column to the LEFT
+                my_account_col = 0
+                for ac in account_cols:
+                    if ac <= i: my_account_col = ac
+                    else: break
+                
+                # Find Month label (search up from this balance column)
+                month = "Total"
+                found_m = False
+                for r_search in range(header_idx):
+                    for c_search in range(i, my_account_col - 1, -1):
+                        cell = str(df.iloc[r_search, c_search])
+                        if any(m in cell for m in month_keywords):
+                            month = cell.strip().replace('[','').replace(']','')
+                            found_m = True
+                            break
+                    if found_m: break
+                
+                # 4. Extract Data Segment
+                temp = pd.DataFrame()
+                temp['Account'] = data_rows.iloc[:, my_account_col].astype(str).str.strip()
+                temp['Amount'] = data_rows.iloc[:, i].apply(clean_to_float)
+                temp['Month'] = month
+                
+                # Filter out empty or header-like rows
+                temp = temp[~temp['Account'].str.lower().isin(['nan', 'total', 'grand total', 'particulars', '', '`'])]
+                all_month_data.append(temp)
 
-        if not all_segments:
-            return None, "No data found. Check if your columns are labeled 'Particulars' and 'Balance'."
+        if not all_month_data:
+            return None, "No Closing Balance columns detected."
 
-        return pd.concat(all_segments).reset_index(drop=True), None
+        return pd.concat(all_month_data).reset_index(drop=True), None
 
     except Exception as e:
-        return None, f"Fatal Error: {str(e)}"
+        return None, f"Parsing Error: {str(e)}"
 
-# --- INTERFACE ---
-st.title("📊 Universal Trial Balance Dashboard")
+# --- STREAMLIT UI ---
+st.title("📊 Master Financial Dashboard")
+st.markdown("Designed for multi-column and side-by-side Trial Balances.")
 
 uploaded = st.sidebar.file_uploader("Upload CSV", type="csv")
 
 if uploaded:
-    data, err = process_any_file(uploaded)
+    data, err = universal_parser(uploaded)
     if err:
         st.error(err)
     elif data is not None:
-        # Category Logic
+        # Simple Categorization Logic
         def quick_cat(x):
             x = x.lower()
             if any(i in x for i in ['cash', 'bank', 'receivable', 'asset', 'inventory']): return 'Assets'
@@ -114,26 +115,26 @@ if uploaded:
         
         data['Category'] = data['Account'].apply(quick_cat)
         
-        # Period Selector
-        periods = list(data['Month'].unique())
-        sel_period = st.sidebar.selectbox("Choose Period", periods)
-        df_view = data[data['Month'] == sel_period]
+        # Month Filter
+        months = list(data['Month'].unique())
+        sel_month = st.sidebar.selectbox("Select Month", months)
+        view = data[data['Month'] == sel_month]
         
-        # Display Cards
-        assets = df_view[df_view['Category'] == 'Assets']['Amount'].sum()
-        liab = df_view[df_view['Category'] == 'Equity & Liab']['Amount'].sum()
+        # Metrics
+        assets = view[view['Category'] == 'Assets']['Amount'].sum()
+        liab = view[view['Category'] == 'Equity & Liab']['Amount'].sum()
         
         c1, c2, c3 = st.columns(3)
         c1.metric("Total Assets", f"₹{abs(assets):,.2f}")
         c2.metric("Equity & Liabilities", f"₹{abs(liab):,.2f}")
-        c3.metric("Accounting Check", "Balanced ✅" if abs(assets + liab) < 100 else "Difference Found ⚠️")
+        c3.metric("Status", "Balanced ✅" if abs(assets + liab) < 100 else "Difference ⚠️")
         
         st.divider()
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Asset Breakdown")
-            fig = px.pie(df_view[df_view['Category']=='Assets'], values='Amount', names='Account', hole=0.4)
+        col_l, col_r = st.columns(2)
+        with col_l:
+            st.subheader("Financial Composition")
+            fig = px.pie(view, values=view['Amount'].abs(), names='Category', hole=0.4)
             st.plotly_chart(fig, use_container_width=True)
-        with col2:
-            st.subheader("Data List")
-            st.dataframe(df_view[['Account', 'Category', 'Amount']], use_container_width=True, height=400)
+        with col_r:
+            st.subheader("Data Table")
+            st.dataframe(view[['Account', 'Category', 'Amount']], use_container_width=True, height=400)
