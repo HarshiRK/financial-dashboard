@@ -1,127 +1,107 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import re
 
-st.set_page_config(page_title="Financial Dashboard", layout="wide")
+# Setup
+st.set_page_config(page_title="Closing Balance Dashboard", layout="wide")
 
-def load_and_process_data(file_path):
-    # Load raw CSV and ignore empty rows
-    df = pd.read_csv(file_path, header=None).dropna(how='all')
+def load_data(file):
+    # Load file
+    df = pd.read_csv(file, header=None)
     
-    # 1. FIND DATA HEADERS
-    # We look for the row that contains 'Particulars' AND 'Debit'
+    # 1. Find the row where the data starts (Particulars)
     header_idx = None
     for i, row in df.iterrows():
-        vals = [str(v).strip().lower() for v in row.values if pd.notna(v)]
-        if "particulars" in vals and "debit" in vals:
+        if "Particulars" in row.values:
             header_idx = i
             break
-            
+    
     if header_idx is None:
-        st.error("Could not find data headers. Please ensure 'Particulars' and 'Debit' are in your file.")
+        st.error("Could not find 'Particulars' column. Check your CSV.")
         return None
 
-    # 2. FIND MONTHS
-    # We search the rows ABOVE the header for anything that looks like a month/year
-    month_data = []
-    month_regex = re.compile(r'(january|february|march|april|may|june|july|august|september|october|november|december|202\d)', re.IGNORECASE)
-    
+    # 2. Find the month names (usually 2-3 rows above Particulars)
+    # We'll look for any row above header that has text
+    months = []
     for r in range(header_idx):
         for c, val in enumerate(df.iloc[r]):
-            if pd.notna(val) and month_regex.search(str(val)):
-                clean_month = str(val).replace('[','').replace(']','').strip()
-                month_data.append({'name': clean_month, 'col_start': c})
+            if pd.notna(val) and len(str(val)) > 2:
+                months.append({"name": str(val).strip(), "col": c})
 
-    # 3. EXTRACT DATA BLOCKS
-    all_months_data = []
+    # 3. Extract Account Names and Closing Balances
+    all_data = []
     header_row = df.iloc[header_idx]
     
-    for m in month_data:
-        # Find the Debit and Credit columns belonging to THIS month
-        # They are usually at or to the right of the month label
-        m_col = m['col_start']
+    for m in months:
+        # For each month, find the nearest "Closing" or "Balance" column to its right
+        closing_col = -1
+        # In XYZ format, Closing Balance is usually 4 columns to the right of the month start
+        # We search for the keyword "Closing" or "Balance" in the header row
+        for search_col in range(m['col'], len(header_row)):
+            cell = str(header_row[search_col]).lower()
+            if "closing" in cell or "balance" in cell:
+                # If there are two "Balances", we want the second one (Closing)
+                closing_col = search_col 
         
-        # We look for the next two non-empty numeric columns for Debit/Credit
-        try:
-            # We filter data rows (everything below header)
-            data_rows = df.iloc[header_idx + 1:]
-            
-            # Find which column index has 'Debit' for this specific month section
-            # In your file, Debit is often 2 columns over from Particulars
-            # We look for 'Debit' in the header row starting from the month's column
-            debit_col_local = -1
-            credit_col_local = -1
-            
-            for col_i in range(m_col, len(header_row)):
-                cell_val = str(header_row[col_i]).strip().lower()
-                if cell_val == 'debit' and debit_col_local == -1:
-                    debit_col_local = col_i
-                elif cell_val == 'credit' and credit_col_local == -1:
-                    credit_col_local = col_i
-                if debit_col_local != -1 and credit_col_local != -1:
-                    break
-
-            temp_df = pd.DataFrame({
-                'Account': data_rows.iloc[:, m_col].astype(str),
+        if closing_col != -1:
+            month_df = pd.DataFrame({
+                'Account': df.iloc[header_idx+1:, 0],
                 'Month': m['name'],
-                'Debit': pd.to_numeric(data_rows.iloc[:, debit_col_local], errors='coerce').fillna(0),
-                'Credit': pd.to_numeric(data_rows.iloc[:, credit_col_local], errors='coerce').fillna(0)
+                'Closing_Balance': pd.to_numeric(df.iloc[header_idx+1:, closing_col], errors='coerce').fillna(0)
             })
-            
-            # Filter out header/empty rows within the data
-            temp_df = temp_df[temp_df['Account'] != 'nan']
-            temp_df = temp_df[~temp_df['Account'].str.contains('Particulars', case=False)]
-            
-            # Calculate Balance
-            temp_df['Closing'] = temp_df['Debit'] - temp_df['Credit']
-            all_months_data.append(temp_df)
-        except Exception as e:
-            continue
+            all_data.append(month_df)
 
-    if not all_months_data:
+    if not all_data:
+        st.error("Could not find a 'Closing Balance' column.")
         return None
-        
-    final_df = pd.concat(all_months_data).reset_index(drop=True)
-    
-    # Simple Category Logic
-    def quick_cat(x):
-        x = x.lower()
-        if any(i in x for i in ['cash', 'bank', 'receivable', 'inventory', 'prepaid', 'asset']): return 'Assets'
-        if any(i in x for i in ['payable', 'loan', 'capital', 'equity', 'reserve']): return 'Liabilities/Equity'
-        if any(i in x for i in ['revenue', 'sales', 'income']): return 'Revenue'
-        return 'Expenses'
 
-    final_df['Category'] = final_df['Account'].apply(quick_cat)
-    return final_df
+    combined = pd.concat(all_data).dropna(subset=['Account'])
+    
+    # Categorize
+    def categorize(acc):
+        acc = str(acc).lower()
+        if any(x in acc for x in ['cash', 'bank', 'receivable', 'inventory']): return 'Assets'
+        if any(x in acc for x in ['payable', 'loan', 'capital', 'equity']): return 'Liabilities & Equity'
+        if any(x in acc for x in ['revenue', 'sale', 'income']): return 'Revenue'
+        return 'Expenses'
+    
+    combined['Category'] = combined['Account'].apply(categorize)
+    return combined
 
 # --- UI ---
-st.title("📊 Financial Trial Balance Dashboard")
-file = st.sidebar.file_uploader("Upload CSV", type="csv")
+st.title("💰 Closing Balance Dashboard")
+uploaded_file = st.sidebar.file_uploader("Upload your Trial Balance CSV", type="csv")
 
-if file:
-    data = load_and_process_data(file)
+if uploaded_file:
+    data = load_data(uploaded_file)
     if data is not None:
-        sel_month = st.sidebar.selectbox("Select Month", data['Month'].unique())
-        df_view = data[data['Month'] == sel_month]
+        month = st.sidebar.selectbox("Select Month", data['Month'].unique())
+        filtered = data[data['Month'] == month]
         
-        # Metrics
-        rev = df_view[df_view['Category'] == 'Revenue']['Closing'].sum()
-        exp = df_view[df_view['Category'] == 'Expenses']['Closing'].sum()
-        
+        # Dashboard Cards
+        assets = filtered[filtered['Category'] == 'Assets']['Closing_Balance'].sum()
+        liabilities = filtered[filtered['Category'] == 'Liabilities & Equity']['Closing_Balance'].sum()
+        profit = filtered[filtered['Category'] == 'Revenue']['Closing_Balance'].sum() - filtered[filtered['Category'] == 'Expenses']['Closing_Balance'].sum()
+
         c1, c2, c3 = st.columns(3)
-        c1.metric("Total Revenue", f"${abs(rev):,.2f}")
-        c2.metric("Total Expenses", f"${abs(exp):,.2f}")
-        c3.metric("Net Profit/Loss", f"${(abs(rev) - abs(exp)):,.2f}")
-        
+        c1.metric("Total Assets", f"${assets:,.2f}")
+        c2.metric("Liabilities & Equity", f"${liabilities:,.2f}")
+        c3.metric("Estimated Net Position", f"${profit:,.2f}")
+
         st.divider()
+        
         col_a, col_b = st.columns(2)
         with col_a:
-            st.subheader("Category Breakdown")
-            fig = px.pie(df_view, values=df_view['Closing'].abs(), names='Category', hole=0.3)
+            st.subheader("Balance Sheet Composition")
+            fig = px.pie(filtered[filtered['Category'].isin(['Assets', 'Liabilities & Equity'])], 
+                         values='Closing_Balance', names='Category', hole=0.4)
             st.plotly_chart(fig, use_container_width=True)
+            
         with col_b:
-            st.subheader("Account Details")
-            st.dataframe(df_view[['Account', 'Debit', 'Credit', 'Closing']], height=400)
-    else:
-        st.error("Data processing failed. Check your CSV structure.")
+            st.subheader("Top Account Balances")
+            top10 = filtered.nlargest(10, 'Closing_Balance')
+            fig2 = px.bar(top10, x='Closing_Balance', y='Account', orientation='h')
+            st.plotly_chart(fig2, use_container_width=True)
+            
+        st.subheader("Detailed Data Table")
+        st.dataframe(filtered, use_container_width=True)
