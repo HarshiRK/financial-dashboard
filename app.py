@@ -5,15 +5,14 @@ import re
 
 st.set_page_config(page_title="Universal Financial Dashboard", layout="wide")
 
+# --- CLEAN NUMBER FUNCTION ---
 def clean_to_float(v):
-    """Aggressive cleaner for Dr/Cr and formatted numbers."""
     if pd.isna(v) or str(v).strip() == "":
         return 0.0
     
     s = str(v).upper().strip()
     is_credit = any(x in s for x in ["CR", "-", "("])
     
-    # Extract only digits and decimal
     s = re.sub(r'[^0-9.]', '', s)
     
     try:
@@ -26,78 +25,82 @@ def clean_to_float(v):
         return 0.0
 
 
+# --- UNIVERSAL PARSER (FIXED) ---
 def universal_parser(file):
     try:
         df = pd.read_csv(file, header=None)
-        
-        # 1. Find the Main Header
+
+        # Find header row
         header_idx = None
         for i, row in df.iterrows():
             if any("particular" in str(x).lower() for x in row.values):
                 header_idx = i
                 break
-        
+
         if header_idx is None:
-            return None, "Error: Could not find 'Particulars' header."
+            return None, "Error: 'Particulars' column not found."
 
         header_row = df.iloc[header_idx]
         data_rows = df.iloc[header_idx + 1:]
-        
-        # 2. Identify Account columns
+
+        # Find account columns
         account_cols = []
         for i, val in enumerate(header_row):
-            v_str = str(val).lower()
-            if "particular" in v_str or "account" in v_str or v_str == "`":
+            if "particular" in str(val).lower():
                 account_cols.append(i)
-        
-        all_month_data = []
-        month_keywords = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "202"]
 
-        # 3. Process horizontally
+        all_month_data = []
+        month_keywords = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec","202"]
+
+        # Loop columns
         for i, val in enumerate(header_row):
             h_name = str(val).lower().strip()
-            prev_val = str(df.iloc[header_idx-1, i]).lower().strip() if header_idx > 0 else ""
-            
-            if "balance" in h_name or "closing" in h_name:
-                if "opening" in h_name or "opening" in prev_val:
-                    continue
-                
-                # Find closest Account column
-                my_account_col = 0
-                for ac in account_cols:
-                    if ac <= i:
+
+            # ✅ ONLY closing balance
+            if "closing" in h_name:
+
+                # Find closest account column on LEFT
+                my_account_col = None
+                for ac in reversed(account_cols):
+                    if ac < i:
                         my_account_col = ac
-                    else:
                         break
-                
-                # Find Month
+
+                if my_account_col is None:
+                    continue
+
+                # Find month
                 month = "Total"
-                for r_search in range(header_idx):
-                    for c_search in range(i, my_account_col - 1, -1):
-                        cell = str(df.iloc[r_search, c_search])
+                for r in range(header_idx):
+                    for c in range(i, my_account_col - 1, -1):
+                        cell = str(df.iloc[r, c]).lower()
                         if any(m in cell for m in month_keywords):
-                            month = cell.strip().replace('[','').replace(']','')
+                            month = df.iloc[r, c]
                             break
-                
-                # Extract Data
+
+                # Extract data
                 temp = pd.DataFrame()
                 temp['Account'] = data_rows.iloc[:, my_account_col].astype(str).str.strip()
+                
+                # Remove wrong rows
+                temp = temp[~temp['Account'].str.match(r'^[0-9.\sDrCr()-]+$', na=False)]
+
                 temp['Amount'] = data_rows.iloc[:, i].apply(clean_to_float)
                 temp['Month'] = month
-                
-                temp = temp[~temp['Account'].str.lower().isin(['nan', 'total', 'grand total', 'particulars', '', '`'])]
+
+                temp = temp[temp['Account'].notna()]
+                temp = temp[temp['Account'] != ""]
+
                 all_month_data.append(temp)
 
         if not all_month_data:
-            return None, "No Closing Balance columns detected."
+            return None, "No Closing Balance columns found."
 
         final_df = pd.concat(all_month_data).reset_index(drop=True)
-        final_df['Account'] = final_df['Account'].fillna('').astype(str)
-
         return final_df, None
 
     except Exception as e:
-        return None, f"Parsing Error: {str(e)}"
+        return None, f"Error: {str(e)}"
 
 
 # --- STREAMLIT UI ---
@@ -120,7 +123,7 @@ if uploaded:
                 return 'Expenses'
             
             x = str(x).lower().strip()
-            
+
             if any(i in x for i in ['cash', 'bank', 'receivable', 'asset', 'inventory']):
                 return 'Assets'
             if any(i in x for i in ['payable', 'loan', 'capital', 'equity', 'reserve', 'liability']):
@@ -132,9 +135,13 @@ if uploaded:
 
         data['Category'] = data['Account'].apply(quick_cat)
 
-        # Month Filter
+        # DEBUG (remove later)
+        st.write("Preview Data:", data.head())
+
+        # Month filter
         months = list(data['Month'].unique())
         sel_month = st.sidebar.selectbox("Select Month", months)
+
         view = data[data['Month'] == sel_month]
 
         # Metrics
@@ -148,13 +155,13 @@ if uploaded:
 
         st.divider()
 
-        col_l, col_r = st.columns(2)
+        col1, col2 = st.columns(2)
 
-        with col_l:
+        with col1:
             st.subheader("Financial Composition")
             fig = px.pie(view, values=view['Amount'].abs(), names='Category', hole=0.4)
             st.plotly_chart(fig, use_container_width=True)
 
-        with col_r:
+        with col2:
             st.subheader("Data Table")
             st.dataframe(view[['Account', 'Category', 'Amount']], use_container_width=True, height=400)
